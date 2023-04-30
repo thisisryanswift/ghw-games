@@ -1,18 +1,22 @@
-import json
+import json, datetime
 from os import environ as env
 from urllib.parse import quote_plus, urlencode
 
 from authlib.integrations.flask_client import OAuth
+from flask_pymongo import PyMongo
 from dotenv import find_dotenv, load_dotenv
-from flask import Flask, redirect, render_template, session, url_for
+from flask import Flask, redirect, render_template, session, url_for, request
 
+from forms import LeaderboardForm
 
 ENV_FILE = find_dotenv()
 if ENV_FILE:
     load_dotenv(ENV_FILE)
-    
+
 app = Flask(__name__)
 app.secret_key = env.get("APP_SECRET_KEY")
+
+mongo = PyMongo(app, uri=env.get("MONGO_URI"))
 
 oauth = OAuth(app)
 
@@ -25,7 +29,6 @@ oauth.register(
     },
     server_metadata_url=f'https://{env.get("AUTH0_DOMAIN")}/.well-known/openid-configuration'
 )
-
 
 @app.route("/login")
 def login():
@@ -54,83 +57,72 @@ def logout():
         )
     )
 
+@app.route("/leaderboard/", methods=["POST"])
+def new_leaderboard():
+    raw_leaderboard = request.get_json()
+    raw_leaderboard["date_added"] = datetime.utcnow()
+
+    leaderboard = Leaderboard(**raw_leaderboard)
+    insert_result = leaderboards.insert_one(leaderboard.to_bson())
+    print(leaderboard)
+
+    return leaderboard.to_json()
+
+@app.route("/leaderboard/<leaderboard_id>", methods=["GET"])
+def get_leaderboard(leaderboard_id):
+    leaderboard = leaderboards.find_one_or_404({"_id": ObjectId(leaderboard_id)})
+    return Leaderboard(**leaderboard).to_json()
+
+@app.route("/leaderboards/")
+def list_leaderboards():
+    page = int(request.args.get("page", 1))
+    per_page = 10
+
+    cursor = leaderboards.find().sort("name").skip((page - 1) * per_page).limit(per_page)
+
+    leaderboard_count = leaderboards.count_documents({})
+
+    links = {
+        "self": {"href": url_for(".list_leaderboards", page=page, _external=True)},
+        "last": {
+            "href": url_for(".list_leaderboards", page=leaderboard_count // per_page, _external=True)
+        },
+    }
+
+    if page > 1:
+        links["prev"] = {"href": url_for(".list_leaderboards", page=page - 1, _external=True)}
+
+    if page - 1 < leaderboard_count // per_page:
+        links["next"] = {"href": url_for(".list_leaderboards", page=page + 1, _external=True)}
+
+    return {
+        "leaderboards": [Leaderboard(**leaderboard).to_json() for leaderboard in cursor],
+        "_links": links,
+    }
+
 @app.route("/")
 def home():
     return render_template("home.html", session=session.get('user'), pretty=json.dumps(session.get('user'), indent=4))
 
-@app.route("/scores/", methods=["POST"])
-def new_score():
-    raw_score = request.get_json()
-    raw_score["date_added"] = datetime.utcnow()
+@app.route("/adduser")
+def adduser():
+    if session:
+        users_collection = mongo.db.users
+        users_collection.insert_one(session.get('user'))
+    return "Added user"
 
-    score = Score(**raw_score)
-    insert_result = leaderboards.insert_one(score.to_bson())
-    score.id = PydanticObjectId(str(insert_result.inserted_id))
-    print(score)
-
-    return score.to_json()
-
-@app.route("/scores/<string:slug>", methods=["GET"])
-def get_score(slug):
-    leaderboard = leaderboards.find_one_or_404({"slug": slug})
-    return Score(**leaderboard).to_json()
-
-@app.route("/scores/")
-def list_scores():
-    """
-    GET a list of scores from all leaderboards?
-
-    The results are paginated using the `page` parameter.
-    """
-
-    page = int(request.args.get("page", 1))
-    per_page = 10  # A const value.
-
-    # For pagination, it's necessary to sort by name,
-    # then skip the number of docs that earlier pages would have displayed,
-    # and then to limit to the fixed page size, ``per_page``.
-    cursor = recipes.find().sort("name").skip(per_page * (page - 1)).limit(per_page)
-
-    cocktail_count = recipes.count_documents({})
-
-    links = {
-        "self": {"href": url_for(".list_cocktails", page=page, _external=True)},
-        "last": {
-            "href": url_for(
-                ".list_cocktails", page=(cocktail_count // per_page) + 1, _external=True
-            )
-        },
-    }
-    # Add a 'prev' link if it's not on the first page:
-    if page > 1:
-        links["prev"] = {
-            "href": url_for(".list_cocktails", page=page - 1, _external=True)
-        }
-    # Add a 'next' link if it's not on the last page:
-    if page - 1 < cocktail_count // per_page:
-        links["next"] = {
-            "href": url_for(".list_cocktails", page=page + 1, _external=True)
-        }
-
-    return {
-        "recipes": [Cocktail(**doc).to_json() for doc in cursor],
-        "_links": links,
-    }
+@app.route("/addleaderboard", methods=["GET", "POST"])
+def addleaderboard():
+    form = LeaderboardForm()
+    if form.is_submitted():
+        data = request.form
+        leaderboards_collection = mongo.db.leaderboards
+        leaderboards_collection.insert_one({"name": data.get("name")})
+    return render_template("addleaderboard.html", form=form)
 
 @app.errorhandler(404)
-def resource_not_found(e):
-    """
-    An error-handler to ensure that 404 errors are returned as JSON.
-    """
-    return jsonify(error=str(e)), 404
-
-
-@app.errorhandler(DuplicateKeyError)
-def resource_not_found(e):
-    """
-    An error-handler to ensure that MongoDB duplicate key errors are returned as JSON.
-    """
-    return jsonify(error=f"Duplicate key error."), 400
+def not_found(e):
+    return e, 404
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=env.get("PORT", 3000))
+    app.run(host="0.0.0.0", port=env.get("PORT", 5000))
